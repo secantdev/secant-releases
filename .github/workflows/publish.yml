@@ -1,0 +1,66 @@
+name: Publish
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Exact release version, without v
+        type: string
+        required: false
+      run-id:
+        description: Successful private manual three-OS run for rehearsal
+        type: string
+        required: false
+
+permissions: {}
+
+concurrency:
+  group: publish-${{ inputs.version || inputs.run-id }}
+  cancel-in-progress: false
+
+jobs:
+  stage:
+    runs-on: ubuntu-latest
+    environment: candidate
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.4.2
+      - id: private-read
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3
+        with:
+          client-id: ${{ secrets.SECANT_READ_APP_CLIENT_ID }}
+          private-key: ${{ secrets.SECANT_READ_APP_PRIVATE_KEY }}
+          owner: secantdev
+          repositories: secant
+          permission-actions: read
+      - name: Admit the private Check run
+        id: candidate
+        env:
+          SECANT_VERSION: ${{ inputs.version }}
+          SECANT_MANUAL_RUN_ID: ${{ inputs.run-id }}
+          SECANT_PRIVATE_TOKEN: ${{ steps.private-read.outputs.token }}
+          GH_TOKEN: ${{ github.token }}
+        run: bun tool/cli.ts discover
+      - name: Download only approved candidate artifacts
+        if: steps.candidate.outputs.resume != 'true'
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          github-token: ${{ steps.private-read.outputs.token }}
+          repository: secantdev/secant
+          run-id: ${{ steps.candidate.outputs.run-id }}
+          pattern: "{release-archives,platform-packages,approval-summary}"
+          path: candidate
+      - name: Stage exact candidate bytes or rehearse and delete
+        env:
+          SECANT_VERSION: ${{ inputs.version }}
+          SECANT_MANUAL_RUN_ID: ${{ inputs.run-id }}
+          SECANT_SELECTED_RUN_ID: ${{ steps.candidate.outputs.run-id }}
+          SECANT_PRIVATE_TOKEN: ${{ steps.private-read.outputs.token }}
+          GH_TOKEN: ${{ github.token }}
+        run: bun tool/cli.ts stage
