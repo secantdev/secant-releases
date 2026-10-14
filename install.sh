@@ -1,0 +1,456 @@
+#!/bin/sh
+# MIT License
+#
+# Copyright (c) 2026 secantdev
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+
+set -eu
+
+download_base_url="https://github.com/secantdev/secant-releases/releases"
+requested_version=""
+modify_path=true
+
+usage() {
+  cat <<'EOF'
+Secant POSIX installer
+
+Usage: install.sh [--version <version>] [--no-modify-path]
+
+Options:
+  -h, --help              Show this help.
+  -v, --version VERSION   Install an exact release version (latest by default).
+      --no-modify-path    Do not update the current shell's profile.
+      --download-base-url URL  Override the releases download address.
+EOF
+}
+
+fail() {
+  printf 'Error: %s\n' "$1" >&2
+  exit 1
+}
+
+current_phase=""
+
+# Announce each install phase as it starts, so a slow step is visibly in
+# progress and a failed download can name the phase it interrupted.
+phase() {
+  current_phase=$1
+  printf '%s\n' "$current_phase"
+}
+
+validate_version() {
+  version_value=$1
+  version_source=$2
+  case "$version_value" in
+    "" | *[!0-9A-Za-z.+-]*) fail "Invalid $version_source version: $version_value" ;;
+  esac
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    -v | --version)
+      [ "$#" -ge 2 ] || fail "$1 requires a version"
+      requested_version=$2
+      shift 2
+      ;;
+    --no-modify-path)
+      modify_path=false
+      shift
+      ;;
+    --download-base-url)
+      [ "$#" -ge 2 ] || fail "$1 requires a URL"
+      download_base_url=${2%/}
+      shift 2
+      ;;
+    *)
+      fail "Unknown option: $1"
+      ;;
+  esac
+done
+
+if [ -n "$requested_version" ]; then
+  requested_version=${requested_version#v}
+  validate_version "$requested_version" exact
+fi
+
+case "$(uname -s)" in
+  Darwin)
+    os=darwin
+    manifest_os=macos
+    ;;
+  Linux)
+    os=linux
+    manifest_os=linux
+    ;;
+  MINGW* | MSYS* | CYGWIN*)
+    os=windows
+    manifest_os=windows
+    ;;
+  *)
+    os=unknown
+    manifest_os=unknown
+    ;;
+esac
+
+case "$(uname -m)" in
+  arm64 | aarch64) cpu=arm64 ;;
+  x86_64 | amd64) cpu=x64 ;;
+  *) cpu=unknown ;;
+esac
+
+target="$os-$cpu"
+case "$target" in
+  darwin-arm64 | linux-x64) ;;
+  *) fail "Unsupported platform: $target. Secant supports macOS arm64 and Linux x64." ;;
+esac
+
+manifest_file=candidate-manifest.json
+checksums_file=SHA256SUMS
+license_file=LICENSE
+notices_file=THIRD-PARTY-NOTICES.md
+executable=secant
+install_parent=$HOME/.secant
+install_dir=$install_parent/bin
+temporary_dir=$(mktemp -d "${TMPDIR:-/tmp}/secant-install.XXXXXX")
+install_stage=""
+next_link=""
+probe_pid=""
+watchdog_pid=""
+
+# Every network call is bounded: connect, the whole transfer, and a few
+# retries of curl's transient failures. Nothing else goes to the network.
+connect_timeout_seconds=20
+download_timeout_seconds=600
+download_retries=3
+version_probe_seconds=30
+
+cleanup() {
+  if [ -n "$probe_pid" ]; then
+    kill -s KILL "$probe_pid" 2>/dev/null || true
+  fi
+  if [ -n "$watchdog_pid" ]; then
+    kill "$watchdog_pid" 2>/dev/null || true
+  fi
+  rm -rf "$temporary_dir"
+  if [ -n "$install_stage" ]; then
+    rm -rf "$install_stage"
+  fi
+  if [ -n "$next_link" ]; then
+    rm -f "$next_link"
+  fi
+}
+trap cleanup 0
+trap 'exit 1' HUP INT TERM
+
+download() {
+  download_name=$1
+  download_destination=$2
+  download_url=$release_url/$download_name
+  if download_metadata=$(curl -fsSL \
+    --connect-timeout "$connect_timeout_seconds" \
+    --max-time "$download_timeout_seconds" \
+    --retry "$download_retries" \
+    -w '%{http_code} %{content_type}' \
+    "$download_url" -o "$download_destination"); then
+    :
+  else
+    download_status=${download_metadata%% *}
+    if [ "$download_status" = 404 ] && [ "$download_name" = "$manifest_file" ]; then
+      if [ -z "$requested_version" ]; then
+        fail "No Secant release is published yet (HTTP 404): $download_url"
+      fi
+      fail "Secant version $requested_version is not published (HTTP 404): $download_url"
+    fi
+    fail "$current_phase failed: could not download $download_url (HTTP $download_status)"
+  fi
+  # curl's write-out describes the final response, excluding redirect headers.
+  download_content_type=${download_metadata#* }
+  if printf '%s' "$download_content_type" | grep -iq '^text/html' ||
+    head -c 512 "$download_destination" | grep -Eiq '<!doctype[[:space:]]+html|<html([[:space:]>])'; then
+    fail "$current_phase failed: refused an HTML response from $download_url"
+  fi
+}
+
+manifest_value() {
+  manifest_value_field=$1
+  # The assembler owns a deliberately small string-only projection of JSON.
+  # POSIX provides no JSON parser, so recognize only those unique scalar lines
+  # instead of growing a general parser or requiring jq at install time.
+  awk -v field="$manifest_value_field" '
+    $0 ~ "\\\"" field "\\\"[[:space:]]*:" {
+      value = $0
+      sub(/^[^:]*:[[:space:]]*"/, "", value)
+      sub(/".*/, "", value)
+      count += 1
+    }
+    END {
+      if (count != 1) exit 1
+      print value
+    }
+  ' "$temporary_dir/$manifest_file"
+}
+
+target_manifest_value() {
+  target_manifest_field=$1
+  awk -v target="$target" -v field="$target_manifest_field" '
+    $0 ~ "\\\"key\\\"[[:space:]]*:[[:space:]]*\\\"" target "\\\"" {
+      target_count += 1
+      selected = 1
+      next
+    }
+    selected && $0 ~ "\\\"" field "\\\"[[:space:]]*:" {
+      value = $0
+      sub(/^[^:]*:[[:space:]]*"/, "", value)
+      sub(/".*/, "", value)
+      field_count += 1
+    }
+    selected && /^[[:space:]]*},?[[:space:]]*$/ { selected = 0 }
+    END {
+      if (target_count != 1 || field_count != 1) exit 1
+      print value
+    }
+  ' "$temporary_dir/$manifest_file"
+}
+
+sha256_file() {
+  sha256_path=$1
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$sha256_path" | awk '{ print $1 }'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$sha256_path" | awk '{ print $1 }'
+  else
+    fail "sha256sum or shasum is required to verify Secant"
+  fi
+}
+
+phase "Resolving the Secant release (${requested_version:-latest})"
+command -v curl >/dev/null 2>&1 || fail "curl is required to install Secant"
+case "$download_base_url" in
+  http://* | https://*) ;;
+  *) fail "The download base URL must use HTTP or HTTPS" ;;
+esac
+if [ -n "$requested_version" ]; then
+  release_url="$download_base_url/download/v$requested_version"
+else
+  release_url="$download_base_url/latest/download"
+fi
+
+phase "Fetching the release manifest and checksums"
+download "$manifest_file" "$temporary_dir/$manifest_file"
+
+candidate_version=$(manifest_value version) || fail "Candidate manifest version is malformed"
+validate_version "$candidate_version" candidate
+if [ -n "$requested_version" ]; then
+  [ "$candidate_version" = "$requested_version" ] ||
+    fail "Candidate version $candidate_version does not match requested version $requested_version"
+fi
+
+# Resolve latest only once. All remaining bytes use this manifest's exact tag.
+release_url="$download_base_url/download/v$candidate_version"
+download "$checksums_file" "$temporary_dir/$checksums_file"
+
+[ "$(target_manifest_value os)" = "$manifest_os" ] || fail "Candidate target OS identity is invalid"
+[ "$(target_manifest_value cpu)" = "$cpu" ] || fail "Candidate target CPU identity is invalid"
+[ "$(target_manifest_value executable)" = "$executable" ] || fail "Candidate executable identity is invalid"
+
+# Archive facts come from the selected target block emitted from
+# scripts/targets.ts; the installer owns only its two supported host keys.
+archive=$(target_manifest_value archive) || fail "Candidate archive identity is invalid"
+case "$archive" in
+  "" | *[!0-9A-Za-z._-]*) fail "Candidate archive identity is invalid" ;;
+esac
+archive_type=$(target_manifest_value archiveType) || fail "Candidate archive type is invalid"
+case "$archive_type" in
+  zip | tar.gz) ;;
+  *) fail "Candidate archive type is invalid" ;;
+esac
+
+archive_path=$temporary_dir/$archive
+phase "Downloading $archive"
+download "$archive" "$archive_path"
+
+phase "Verifying $archive"
+expected_archive_sha256=$(
+  awk -v archive="$archive" '
+    $2 == archive && NF == 2 { count += 1; digest = $1 }
+    END {
+      if (count != 1) exit 1
+      print digest
+    }
+  ' "$temporary_dir/$checksums_file"
+) || fail "$archive must appear exactly once in $checksums_file"
+actual_archive_sha256=$(sha256_file "$archive_path")
+[ "$actual_archive_sha256" = "$expected_archive_sha256" ] ||
+  fail "$archive checksum does not match $checksums_file"
+[ "$actual_archive_sha256" = "$(target_manifest_value archiveSha256)" ] ||
+  fail "$archive checksum does not match $manifest_file"
+
+expected_layout=$temporary_dir/expected-layout
+actual_layout=$temporary_dir/actual-layout
+printf '%s\n' "$license_file" "$notices_file" "$executable" | LC_ALL=C sort >"$expected_layout"
+case "$archive_type" in
+  zip)
+    command -v unzip >/dev/null 2>&1 || fail "unzip is required to install Secant on macOS"
+    unzip -Z1 "$archive_path" | LC_ALL=C sort >"$actual_layout"
+    ;;
+  tar.gz)
+    command -v tar >/dev/null 2>&1 || fail "tar is required to install Secant on Linux"
+    tar -tzf "$archive_path" | LC_ALL=C sort >"$actual_layout"
+    ;;
+esac
+cmp -s "$expected_layout" "$actual_layout" ||
+  fail "$archive layout must contain only $executable, $license_file, and $notices_file"
+
+extract_dir=$temporary_dir/extracted
+mkdir "$extract_dir"
+case "$archive_type" in
+  zip) unzip -q "$archive_path" -d "$extract_dir" ;;
+  tar.gz) tar -xzf "$archive_path" -C "$extract_dir" ;;
+esac
+
+[ "$(sha256_file "$extract_dir/$executable")" = "$(target_manifest_value binarySha256)" ] ||
+  fail "Candidate executable checksum is invalid"
+[ "$(sha256_file "$extract_dir/$license_file")" = "$(manifest_value licenseSha256)" ] ||
+  fail "Candidate $license_file checksum is invalid"
+[ "$(sha256_file "$extract_dir/$notices_file")" = "$(manifest_value noticesSha256)" ] ||
+  fail "Candidate $notices_file checksum is invalid"
+chmod 755 "$extract_dir/$executable"
+
+if [ "$os" = darwin ]; then
+  command -v codesign >/dev/null 2>&1 || fail "codesign is required to verify Secant on macOS"
+  codesign --verify --deep --strict "$extract_dir/$executable" ||
+    fail "Candidate executable failed strict macOS signature verification"
+fi
+
+# Bound the local version probe without timeout(1), which is not POSIX: run
+# it in the background and let a watchdog kill it once the bound expires. Its
+# output goes to files, never a pipe, so a killed probe cannot hold the
+# installer's own output open. The watchdog sleeps one second at a time so
+# cancelling it never strands a long sleep.
+probe_dir=$temporary_dir/version-probe
+mkdir "$probe_dir"
+"$extract_dir/$executable" --version >"$probe_dir/stdout" 2>"$probe_dir/stderr" </dev/null &
+probe_pid=$!
+(
+  waited=0
+  while [ "$waited" -lt "$version_probe_seconds" ]; do
+    sleep 1
+    waited=$((waited + 1))
+  done
+  : >"$probe_dir/timed-out"
+  kill -s KILL "$probe_pid"
+) >/dev/null 2>&1 &
+watchdog_pid=$!
+if wait "$probe_pid" 2>/dev/null; then
+  probe_status=0
+else
+  probe_status=$?
+fi
+probe_pid=""
+kill "$watchdog_pid" 2>/dev/null || true
+wait "$watchdog_pid" 2>/dev/null || true
+watchdog_pid=""
+[ ! -e "$probe_dir/timed-out" ] ||
+  fail "Candidate executable could not report its version within $version_probe_seconds seconds"
+if [ "$probe_status" -ne 0 ]; then
+  cat "$probe_dir/stderr" >&2
+  fail "Candidate executable could not report its version"
+fi
+reported_version=$(cat "$probe_dir/stdout")
+[ "$reported_version" = "$candidate_version" ] ||
+  fail "Candidate executable reported version $reported_version instead of $candidate_version"
+
+phase "Installing Secant $candidate_version to $install_dir"
+# Stage one immutable layout on the destination filesystem, then atomically
+# switch the fixed bin path. The previous executable and its legal material
+# therefore remain one coherent installation until the single rename.
+releases_dir=$install_parent/releases
+release_name=$candidate_version-$actual_archive_sha256
+release_dir=$releases_dir/$release_name
+mkdir -p "$releases_dir"
+if [ -e "$install_dir" ] && [ ! -L "$install_dir" ]; then
+  fail "$install_dir exists but is not a Secant-managed installation"
+fi
+if [ ! -d "$release_dir" ]; then
+  install_stage=$releases_dir/.install.$$
+  rm -rf "$install_stage"
+  mkdir "$install_stage"
+  cp "$extract_dir/$license_file" "$install_stage/$license_file"
+  cp "$extract_dir/$notices_file" "$install_stage/$notices_file"
+  cp "$extract_dir/$executable" "$install_stage/$executable"
+  chmod 755 "$install_stage/$executable"
+  mv "$install_stage" "$release_dir"
+  install_stage=""
+else
+  [ "$(sha256_file "$release_dir/$executable")" = "$(target_manifest_value binarySha256)" ] ||
+    fail "Existing staged release has an invalid executable"
+  [ "$(sha256_file "$release_dir/$license_file")" = "$(manifest_value licenseSha256)" ] ||
+    fail "Existing staged release has invalid legal material"
+  [ "$(sha256_file "$release_dir/$notices_file")" = "$(manifest_value noticesSha256)" ] ||
+    fail "Existing staged release has invalid legal material"
+fi
+next_link=$install_parent/.bin.$$
+rm -f "$next_link"
+ln -s "releases/$release_name" "$next_link"
+if mv --help 2>&1 | grep -q no-target-directory; then
+  # GNU mv spells the no-dereference operation as --no-target-directory.
+  mv -fT "$next_link" "$install_dir"
+else
+  # BSD mv uses -h to replace a symlink-to-directory rather than following it.
+  mv -fh "$next_link" "$install_dir"
+fi
+next_link=""
+
+print_install_result() {
+  printf 'Secant %s installed at %s.\n' "$candidate_version" "$install_dir/$executable"
+  if [ "$os" = darwin ]; then
+    printf 'Run Secant from Terminal; do not double-click a downloaded executable.\n'
+  fi
+}
+
+path_instruction='export PATH="$HOME/.secant/bin:$PATH"'
+if [ "$modify_path" = false ]; then
+  print_install_result
+  printf 'To persist Secant on PATH, add this exact line to your shell profile:\n%s\n' "$path_instruction"
+  exit 0
+fi
+
+case ":${PATH:-}:" in
+  *":$install_dir:"*) ;;
+  *)
+    case "${SHELL:-}" in
+      */zsh) profile=$HOME/.zshrc ;;
+      */bash) profile=$HOME/.bashrc ;;
+      *) profile=$HOME/.profile ;;
+    esac
+    touch "$profile"
+    if ! grep -Fqx "$path_instruction" "$profile"; then
+      printf '\n# Secant\n%s\n' "$path_instruction" >>"$profile"
+    fi
+    printf 'Added Secant to PATH in %s. Restart your shell to use it.\n' "$profile"
+    ;;
+esac
+
+print_install_result

@@ -74,6 +74,7 @@ export function validateCandidate(
   files: ReadonlyMap<string, Uint8Array>,
   facts: {
     readonly version?: string;
+    readonly requireApproval?: boolean;
     readonly run?: { readonly id: number; readonly commit: string };
   },
 ) {
@@ -118,6 +119,7 @@ export function validateCandidate(
     { package: string; executable: string }
   > = {};
   const checksums: string[] = [];
+  const publications: { name: string; tarball: string; sha256: string }[] = [];
   for (const [index, identity] of identities.entries()) {
     const target = targets[index];
     const pkg = packed[index];
@@ -141,6 +143,11 @@ export function validateCandidate(
     );
     add(identity.archive, target.archiveSha256);
     add(filename(pkg.tarball), pkg.tarballSha256);
+    publications.push({
+      name: identity.package,
+      tarball: filename(pkg.tarball),
+      sha256: hash(pkg.tarballSha256),
+    });
     checksums.push(`${hash(target.archiveSha256)}  ${identity.archive}`);
     expectedPlatforms[`${identity.npmOs}-${identity.cpu}`] = {
       package: identity.package,
@@ -162,6 +169,11 @@ export function validateCandidate(
     );
   }
   add(filename(launcher.tarball), launcher.tarballSha256);
+  publications.push({
+    name: "@secantdev/secant",
+    tarball: filename(launcher.tarball),
+    sha256: hash(launcher.tarballSha256),
+  });
   add("SHA256SUMS");
   requireFact(
     Buffer.from(approved.get("SHA256SUMS")!)
@@ -177,6 +189,8 @@ export function validateCandidate(
   ])
     add(name);
   let summary = "";
+  if (facts.requireApproval)
+    requireFact(files.has("approval-summary.json"), "missing-summary");
   if (files.has("approval-summary.json")) {
     summary = approvalSummary(
       files.get("approval-summary.json"),
@@ -186,14 +200,17 @@ export function validateCandidate(
     add("approval-summary.json");
   }
   requireFact(files.size === approved.size, "unexpected-file");
-  return { version: manifest.version, assets: approved, summary };
+  return { version: manifest.version, assets: approved, summary, publications };
 }
 
 // Never render downloaded Markdown or arbitrary producer output in public logs.
 // Only this allowlisted JSON contract can become the public approval summary.
 function approvalSummary(
   bytes: Uint8Array | undefined,
-  facts: { readonly run?: { readonly id: number; readonly commit: string } },
+  facts: {
+    readonly run?: { readonly id: number; readonly commit: string };
+    readonly requireApproval?: boolean;
+  },
   approved: ReadonlyMap<string, Uint8Array>,
 ): string {
   const value = json(bytes);
@@ -227,7 +244,14 @@ function approvalSummary(
       (value.runId === facts.run.id && value.commit === facts.run.commit),
     "summary-mismatch",
   );
-  const artifacts = list(value.artifacts).map((artifact) => {
+  const entries = list(value.artifacts);
+  if (facts.requireApproval)
+    requireFact(
+      entries.length === approved.size &&
+        new Set(entries.map((entry) => entry.name)).size === approved.size,
+      "summary-mismatch",
+    );
+  const artifacts = entries.map((artifact) => {
     requireFact(
       Object.keys(artifact).every((key) =>
         ["name", "size", "sha256"].includes(key),

@@ -25,7 +25,7 @@ export interface CliOptions {
   readonly run: CommandRunner;
   readonly fetch: (url: string | URL, init?: RequestInit) => Promise<Response>;
   readonly selectedRunId?: number;
-  readonly privateToken: string;
+  readonly privateToken?: string;
   readonly publicToken: string;
   readonly candidateDir: string;
 }
@@ -58,7 +58,9 @@ function command(options: CliOptions, repo: string, args: readonly string[]) {
     command: "gh",
     args: [...args, "--repo", repo],
     token:
-      repo === "secantdev/secant" ? options.privateToken : options.publicToken,
+      repo === "secantdev/secant"
+        ? (options.privateToken ?? "")
+        : options.publicToken,
   });
 }
 function checked(
@@ -199,6 +201,47 @@ function localFiles(root: string): Map<string, Uint8Array> {
 
 export function createCliPort(options: CliOptions): PublishPort {
   return {
+    async publishPackage(_name, bytes) {
+      const dir = mkdtempSync(join(tmpdir(), "secant-npm-"));
+      try {
+        const path = join(dir, "approved.tgz");
+        writeFileSync(path, bytes);
+        const result = options.run({
+          command: "npm",
+          args: [
+            "publish",
+            path,
+            "--provenance",
+            "--access",
+            "public",
+            "--ignore-scripts",
+          ],
+          token: "",
+        });
+        if (result.status !== 0)
+          throw new Error("command-failed", { cause: result });
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    },
+    async exposeRelease(tag, notes) {
+      const dir = mkdtempSync(join(tmpdir(), "secant-notes-"));
+      try {
+        const path = join(dir, "notes.md");
+        writeFileSync(path, notes);
+        checked(options, "secantdev/secant-releases", [
+          "release",
+          "edit",
+          tag,
+          "--draft=false",
+          "--latest",
+          "--notes-file",
+          path,
+        ]);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    },
     findRun: (request) => findRun(options, request),
     async readCandidate(run) {
       const files = new Map<string, Uint8Array>();

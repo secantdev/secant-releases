@@ -26,6 +26,8 @@ export interface ReleaseState {
   readonly assets: ReadonlyMap<string, Uint8Array>;
 }
 export interface PublishPort {
+  publishPackage(name: string, bytes: Uint8Array): Promise<void>;
+  exposeRelease(tag: string, notes: string): Promise<void>;
   findRun(request: StageRequest): Promise<PrivateRun | undefined>;
   readCandidate(run: PrivateRun): Promise<ReadonlyMap<string, Uint8Array>>;
   readRelease(tag: string): Promise<ReleaseState | undefined>;
@@ -216,12 +218,70 @@ export async function stage(
     if (request.kind === "rehearsal") await port.deleteDraft(tag);
     return stagedOutcome(tag, candidate);
   } catch (cause) {
-    return cause instanceof CandidateRefusal
-      ? {
-          kind: "refused",
-          reason: cause.message,
-          ...(cause.cause === undefined ? {} : { cause: cause.cause }),
-        }
-      : { kind: "refused", reason: "external-failure", cause };
+    return refused(cause);
   }
+}
+
+export async function release(
+  request: { readonly version: string; readonly changelog: string },
+  port: PublishPort,
+): Promise<
+  | { readonly kind: "done"; readonly tag: string }
+  | Extract<StageOutcome, { kind: "refused" }>
+> {
+  try {
+    if (!/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.test(request.version))
+      return { kind: "refused", reason: "invalid-request" };
+    const notes = changelogNotes(request.version, request.changelog);
+    if (notes === undefined)
+      return { kind: "refused", reason: "missing-changelog" };
+    const tag = `v${request.version}`;
+    const staged = await port.readRelease(tag);
+    if (!staged) return { kind: "refused", reason: "missing-draft" };
+    const candidate = validateCandidate(staged.assets, {
+      version: request.version,
+      requireApproval: true,
+    });
+    for (const pkg of candidate.publications) {
+      const existing = await port.inspectPackage(
+        pkg.name,
+        candidate.version,
+        pkg.sha256,
+      );
+      if (existing === "conflicting")
+        return { kind: "refused", reason: "npm-conflict" };
+      if (existing === "missing") {
+        if (!staged.draft)
+          return { kind: "refused", reason: "incomplete-publication" };
+        await port.publishPackage(pkg.name, candidate.assets.get(pkg.tarball)!);
+      }
+    }
+    // Approval binds every staged byte, including manifests and the summary.
+    // Re-read before visibility so an intervening asset edit cannot be published.
+    const current = await port.readRelease(tag);
+    if (
+      !current ||
+      current.assets.size !== candidate.assets.size ||
+      [...candidate.assets].some(
+        ([name, bytes]) =>
+          !current.assets.has(name) ||
+          digest(current.assets.get(name)!) !== digest(bytes),
+      )
+    )
+      return { kind: "refused", reason: "asset-conflict" };
+    if (current.draft) await port.exposeRelease(tag, notes);
+    return { kind: "done", tag };
+  } catch (cause) {
+    return refused(cause);
+  }
+}
+
+function refused(cause: unknown): Extract<StageOutcome, { kind: "refused" }> {
+  return cause instanceof CandidateRefusal
+    ? {
+        kind: "refused",
+        reason: cause.message,
+        ...(cause.cause === undefined ? {} : { cause: cause.cause }),
+      }
+    : { kind: "refused", reason: "external-failure", cause };
 }

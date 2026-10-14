@@ -10,6 +10,7 @@ import {
   admittedRun,
   readStageDraft,
   stage,
+  release,
   type StageRequest,
 } from "./publish.js";
 
@@ -19,12 +20,29 @@ export async function runPublishCli(options: {
   readonly run: CommandRunner;
   readonly fetch: CliOptions["fetch"];
   readonly write: (text: string) => void;
+  readonly readChangelog?: () => string;
 }): Promise<number> {
   try {
     const mode = options.args[0];
     const env = options.environment;
-    if (options.args.length !== 1 || (mode !== "discover" && mode !== "stage"))
+    if (
+      options.args.length !== 1 ||
+      (mode !== "discover" && mode !== "stage" && mode !== "release")
+    )
       throw new Error("invalid-request");
+    if (
+      mode === "release" &&
+      (env.GITHUB_ACTIONS !== "true" ||
+        env.GITHUB_REPOSITORY !== "secantdev/secant-releases" ||
+        env.GITHUB_EVENT_NAME !== "workflow_dispatch" ||
+        env.GITHUB_REF !== "refs/heads/main" ||
+        env.GITHUB_WORKFLOW_REF !==
+          "secantdev/secant-releases/.github/workflows/publish.yml@refs/heads/main" ||
+        !env.ACTIONS_ID_TOKEN_REQUEST_URL ||
+        !env.ACTIONS_ID_TOKEN_REQUEST_TOKEN ||
+        env.NODE_AUTH_TOKEN)
+    )
+      throw new Error("invalid-publication-context");
     const version = env.SECANT_VERSION ?? "";
     const manual = env.SECANT_MANUAL_RUN_ID ?? "";
     if (
@@ -39,14 +57,22 @@ export async function runPublishCli(options: {
           kind: "version",
           version,
           changelog:
-            mode === "stage" ? readFileSync("CHANGELOG.md", "utf8") : "",
+            mode !== "discover"
+              ? (
+                  options.readChangelog ??
+                  (() => readFileSync("CHANGELOG.md", "utf8"))
+                )()
+              : "",
         }
       : { kind: "rehearsal", runId: Number(manual) };
     if (request.kind === "rehearsal" && !Number.isSafeInteger(request.runId))
       throw new Error("invalid-request");
     const privateToken = env.SECANT_PRIVATE_TOKEN;
     const publicToken = env.GH_TOKEN;
-    if (!privateToken || !publicToken) throw new Error("missing-credential");
+    if ((!privateToken && mode !== "release") || !publicToken)
+      throw new Error("missing-credential");
+    if (mode === "release" && (request.kind !== "version" || privateToken))
+      throw new Error("invalid-request");
     const selected = env.SECANT_SELECTED_RUN_ID;
     if (
       selected &&
@@ -61,6 +87,15 @@ export async function runPublishCli(options: {
       publicToken,
       candidateDir: env.SECANT_CANDIDATE_DIR ?? "candidate",
     });
+    if (mode === "release") {
+      if (request.kind !== "version") throw new Error("invalid-request");
+      const result = await release(request, port);
+      if (result.kind === "refused") {
+        options.write(`Publish refused: ${result.reason}\n`);
+        return 1;
+      }
+      return 0;
+    }
     if (mode === "discover") {
       const draft = await readStageDraft(request, port);
       if (draft.kind === "complete") {
