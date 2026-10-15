@@ -50,7 +50,7 @@ Each release's notes are in the [CHANGELOG](./CHANGELOG.md).
 ## Licence
 
 Secant is free to use, including at work. You may not redistribute, modify, decompile or reverse engineer it. Secant is provided "as is", without
-warranty of any kind. The full terms are in the `LICENSE.md` file inside every release. The installer scripts in this repository are MIT
+warranty of any kind. The full terms are in [LICENSE.md](./LICENSE.md) and inside every release. The installer scripts in this repository are MIT
 licensed.
 
 ## Get help
