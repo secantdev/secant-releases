@@ -32,7 +32,7 @@ Set-StrictMode -Version Latest
 
 $ArchiveName = "secant-windows-x64.zip"
 $ExecutableName = "secant.exe"
-$LicenseName = "LICENSE"
+$LicenseName = "LICENSE.md"
 $NoticesName = "THIRD-PARTY-NOTICES.md"
 $ManifestName = "candidate-manifest.json"
 $ChecksumsName = "SHA256SUMS"

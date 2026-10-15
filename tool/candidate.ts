@@ -95,11 +95,18 @@ export function validateCandidate(
   for (const other of [packages, launcher]) {
     requireFact(other.version === manifest.version, "version-mismatch");
     requireFact(
-      other.licenseSha256 === manifest.licenseSha256 &&
-        other.noticesSha256 === manifest.noticesSha256,
+      other.noticesSha256 === manifest.noticesSha256,
       "legal-mismatch",
     );
   }
+  // Platform packages carry the product LICENSE.md. The launcher stays MIT; this
+  // isolated tool cannot know the MIT digest, so it only refuses a launcher that
+  // carries the product licence. The private legal closure pins the MIT bytes.
+  requireFact(
+    packages.licenseSha256 === manifest.licenseSha256 &&
+      hash(launcher.licenseSha256) !== manifest.licenseSha256,
+    "legal-mismatch",
+  );
   const packed = list(packages.packages);
   requireFact(
     targets.length === identities.length && packed.length === identities.length,

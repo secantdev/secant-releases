@@ -128,7 +128,7 @@ esac
 
 manifest_file=candidate-manifest.json
 checksums_file=SHA256SUMS
-license_file=LICENSE
+license_file=LICENSE.md
 notices_file=THIRD-PARTY-NOTICES.md
 executable=secant
 install_parent=$HOME/.secant
