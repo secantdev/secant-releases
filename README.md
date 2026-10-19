@@ -53,6 +53,8 @@ Secant is free to use, including at work. You may not redistribute, modify, deco
 warranty of any kind. The full terms are in [LICENSE.md](./LICENSE.md) and inside every release. The installer scripts in this repository are MIT
 licensed.
 
+The included workflow's skills come from Matt Pocock's [skills](https://github.com/mattpocock/skills), MIT licensed.
+
 ## Get help
 
 See [SUPPORT](./SUPPORT.md) for where to ask, how to report a security problem, and what to include.
