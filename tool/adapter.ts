@@ -8,13 +8,19 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import {
+  commandEnvironment,
+  npmEnvironment,
+  listSiteEntries,
+  deploySite,
+} from "./docs-site.js";
 import { CandidateRefusal, digest, filename, record } from "./candidate.js";
 import type { PrivateRun, PublishPort, StageRequest } from "./publish.js";
 
 export interface CommandRequest {
   readonly command: string;
   readonly args: readonly string[];
-  readonly token: string;
+  readonly env: Readonly<Record<string, string>>;
 }
 export type CommandRunner = (request: CommandRequest) => {
   readonly status: number;
@@ -22,6 +28,7 @@ export type CommandRunner = (request: CommandRequest) => {
   readonly stderr: string;
 };
 export interface CliOptions {
+  readonly environment?: NodeJS.ProcessEnv;
   readonly run: CommandRunner;
   readonly fetch: (url: string | URL, init?: RequestInit) => Promise<Response>;
   readonly selectedRunId?: number;
@@ -57,10 +64,13 @@ function command(options: CliOptions, repo: string, args: readonly string[]) {
   return options.run({
     command: "gh",
     args: [...args, "--repo", repo],
-    token:
-      repo === "secantdev/secant"
-        ? (options.privateToken ?? "")
-        : options.publicToken,
+    env: {
+      ...commandEnvironment(options.environment),
+      GH_TOKEN:
+        repo === "secantdev/secant"
+          ? (options.privateToken ?? "")
+          : options.publicToken,
+    },
   });
 }
 function checked(
@@ -201,6 +211,8 @@ function localFiles(root: string): Map<string, Uint8Array> {
 
 export function createCliPort(options: CliOptions): PublishPort {
   return {
+    listSiteEntries: async (bytes) => listSiteEntries(options, bytes),
+    deploySite: async (bytes) => deploySite(options, bytes),
     async publishPackage(_name, bytes) {
       const dir = mkdtempSync(join(tmpdir(), "secant-npm-"));
       try {
@@ -216,7 +228,7 @@ export function createCliPort(options: CliOptions): PublishPort {
             "public",
             "--ignore-scripts",
           ],
-          token: "",
+          env: npmEnvironment(options.environment),
         });
         if (result.status !== 0)
           throw new Error("command-failed", { cause: result });
@@ -248,6 +260,7 @@ export function createCliPort(options: CliOptions): PublishPort {
       for (const artifact of [
         "release-archives",
         "platform-packages",
+        "docs-site",
         ...(run.artifacts.includes("approval-summary")
           ? ["approval-summary"]
           : []),
@@ -299,7 +312,24 @@ export function createCliPort(options: CliOptions): PublishPort {
       } finally {
         rmSync(dir, { recursive: true, force: true });
       }
-      return { draft: value.isDraft, assets };
+      // gh release view has no isLatest field. The public latest endpoint names
+      // the release GitHub actually serves, independent of semver ordering.
+      let latest = false;
+      if (!value.isDraft) {
+        const response = await options.fetch(
+          "https://api.github.com/repos/secantdev/secant-releases/releases/latest",
+          {
+            headers: { Accept: "application/vnd.github+json" },
+            signal: AbortSignal.timeout(30_000),
+          },
+        );
+        if (response.status !== 404) {
+          if (!response.ok)
+            throw new Error("latest-read-failed", { cause: response.status });
+          latest = string(record(await response.json()).tag_name) === tag;
+        }
+      }
+      return { draft: value.isDraft, latest, assets };
     },
     async createDraft(tag, notes) {
       const dir = mkdtempSync(join(tmpdir(), "secant-notes-"));

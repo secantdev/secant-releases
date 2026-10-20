@@ -2,6 +2,10 @@
 
 What changed in each Secant release, newest first. Each release's notes on GitHub are its section here.
 
+## 0.3.0
+
+Release notes follow the M14 audit.
+
 ## 0.2.0
 
 The first release published from this repository. Earlier releases are not supported; install this one with the commands in the

@@ -1,3 +1,4 @@
+import { safeSiteEntries, type SiteEntry } from "./docs-site.js";
 import { CandidateRefusal, digest, validateCandidate } from "./candidate.js";
 
 export type StageRequest =
@@ -23,9 +24,12 @@ export interface PrivateRun {
 }
 export interface ReleaseState {
   readonly draft: boolean;
+  readonly latest: boolean;
   readonly assets: ReadonlyMap<string, Uint8Array>;
 }
 export interface PublishPort {
+  listSiteEntries(bytes: Uint8Array): Promise<readonly SiteEntry[]>;
+  deploySite(bytes: Uint8Array): Promise<void>;
   publishPackage(name: string, bytes: Uint8Array): Promise<void>;
   exposeRelease(tag: string, notes: string): Promise<void>;
   findRun(request: StageRequest): Promise<PrivateRun | undefined>;
@@ -89,7 +93,7 @@ export function admittedRun(request: StageRequest, run: PrivateRun): boolean {
             job.conclusion === "success",
         ).length === 1,
     ) &&
-    ["release-archives", "platform-packages"].every((name) =>
+    ["release-archives", "platform-packages", "docs-site"].every((name) =>
       run.artifacts.includes(name),
     )
   );
@@ -270,7 +274,32 @@ export async function release(
     )
       return { kind: "refused", reason: "asset-conflict" };
     if (current.draft) await port.exposeRelease(tag, notes);
-    return { kind: "done", tag };
+    return await deployDocs({ kind: "version", ...request }, port);
+  } catch (cause) {
+    return refused(cause);
+  }
+}
+
+// This operation re-reads visible public bytes, including on a retry after deploy
+// failure. Approval, not a newly computed digest, authorizes the site archive.
+export async function deployDocs(request: StageRequest, port: PublishPort) {
+  try {
+    if (request.kind === "rehearsal")
+      return { kind: "refused" as const, reason: "rehearsal-deploy" };
+    const tag = `v${request.version}`;
+    const visible = await port.readRelease(tag);
+    if (!visible) throw new CandidateRefusal("missing-release");
+    if (visible.draft) throw new CandidateRefusal("draft-release");
+    if (!visible.latest) throw new CandidateRefusal("not-latest");
+    const candidate = validateCandidate(visible.assets, {
+      version: request.version,
+      requireApproval: true,
+    });
+    const bytes = candidate.assets.get("docs-site.tar.gz")!;
+    if (!safeSiteEntries(await port.listSiteEntries(bytes)))
+      throw new CandidateRefusal("unsafe-site-archive");
+    await port.deploySite(bytes);
+    return { kind: "done" as const, tag };
   } catch (cause) {
     return refused(cause);
   }

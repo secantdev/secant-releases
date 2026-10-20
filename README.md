@@ -1,7 +1,7 @@
 # Secant
 
 Secant is a terminal app that helps you plan and build software with a coding agent. You pick a workflow, pick Claude Code or Codex, and Secant
-runs the workflow step by step in your project, asking you when it needs a decision. The included **Matt Front Spec** workflow turns an idea into a
+runs the workflow step by step in your project, asking you when it needs a decision. The included **Spec First** workflow turns an idea into a
 spec and tickets, then helps you work through the tickets one at a time.
 
 ## Install
@@ -40,7 +40,7 @@ First install and sign in to Claude Code, or to Codex 0.159.0 or newer. Then ope
 secant
 ```
 
-Approve the folder, choose **Start a Run** → **Matt Front Spec**, pick your coding agent, and describe your idea. Run `secant --help` to see the
+Approve the folder, choose **Start a Run** → **Spec First**, pick your coding agent, and describe your idea. Run `secant --help` to see the
 other commands.
 
 ## What changed

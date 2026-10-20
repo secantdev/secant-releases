@@ -1,0 +1,8 @@
+{
+  "name": "secant-docs",
+  "account_id": "98f5129a76dd13c39485bd036cfa4380",
+  "compatibility_date": "2026-10-01",
+  "assets": { "directory": "./assets" },
+  "workers_dev": false,
+  "preview_urls": true,
+}

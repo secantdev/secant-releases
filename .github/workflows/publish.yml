@@ -54,7 +54,7 @@ jobs:
           github-token: ${{ steps.private-read.outputs.token }}
           repository: secantdev/secant
           run-id: ${{ steps.candidate.outputs.run-id }}
-          pattern: "{release-archives,platform-packages,approval-summary}"
+          pattern: "{release-archives,platform-packages,docs-site,approval-summary}"
           path: candidate
       - name: Stage exact candidate bytes or rehearse and delete
         env:
@@ -68,6 +68,9 @@ jobs:
   release:
     needs: stage
     if: inputs.version != '' && inputs.run-id == ''
+    concurrency:
+      group: publish-production
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     environment: release
     permissions:
@@ -84,8 +87,11 @@ jobs:
         with:
           node-version: "24"
       - run: npm install --global npm@11.5.1
-      - name: Publish staged npm tarballs and make GitHub visible
+      - name: Install the pinned docs deploy tool without scripts
+        run: bun install --cwd tool/docs-deploy --frozen-lockfile --ignore-scripts
+      - name: Publish npm, make GitHub visible, then deploy approved docs
         env:
           SECANT_VERSION: ${{ inputs.version }}
           GH_TOKEN: ${{ github.token }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.SECANT_DOCS_API_TOKEN }}
         run: bun tool/cli.ts release

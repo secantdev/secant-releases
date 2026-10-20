@@ -69,7 +69,11 @@ export async function runPublishCli(options: {
       throw new Error("invalid-request");
     const privateToken = env.SECANT_PRIVATE_TOKEN;
     const publicToken = env.GH_TOKEN;
-    if ((!privateToken && mode !== "release") || !publicToken)
+    if (
+      (!privateToken && mode !== "release") ||
+      !publicToken ||
+      (mode === "release" && !env.CLOUDFLARE_API_TOKEN)
+    )
       throw new Error("missing-credential");
     if (mode === "release" && (request.kind !== "version" || privateToken))
       throw new Error("invalid-request");
@@ -80,6 +84,7 @@ export async function runPublishCli(options: {
     )
       throw new Error("invalid-request");
     const port = createCliPort({
+      environment: env,
       selectedRunId: selected ? Number(selected) : undefined,
       run: options.run,
       fetch: options.fetch,
@@ -139,9 +144,9 @@ if (import.meta.main) {
     write: (text) => process.stdout.write(text),
     run: (request) => {
       const result = spawnSync(request.command, [...request.args], {
-        env: { ...process.env, GH_TOKEN: request.token },
+        env: request.env,
         encoding: "utf8",
-        timeout: 60_000,
+        timeout: request.command === "node" ? 300_000 : 60_000,
         stdio: ["ignore", "pipe", "pipe"],
       });
       return {

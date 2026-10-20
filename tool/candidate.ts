@@ -193,6 +193,7 @@ export function validateCandidate(
     "candidate-manifest.json",
     "package-manifest.json",
     "launcher-manifest.json",
+    "docs-site.tar.gz",
   ])
     add(name);
   let summary = "";
